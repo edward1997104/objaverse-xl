@@ -383,11 +383,19 @@ class GitHubDownloader(ObjaverseSource):
 
     @classmethod
     def _list_files(cls, root_dir: str) -> List[str]:
-        return [
-            os.path.join(root, f)
-            for root, dirs, files in os.walk(root_dir)
-            for f in files
-        ]
+        files = []
+        for root, dirs, filenames in os.walk(root_dir, followlinks=False):
+            for f in filenames:
+                try:
+                    file_path = os.path.join(root, f)
+                    # Check if the file exists and is not a broken symlink
+                    if os.path.exists(file_path) or not os.path.islink(file_path):
+                        files.append(file_path)
+                except (OSError, FileNotFoundError):
+                    # Skip files that can't be accessed (broken symlinks, permission issues, etc.)
+                    logger.debug(f"Skipping inaccessible file: {os.path.join(root, f)}")
+                    continue
+        return files
 
     @classmethod
     def _pull_lfs_files(cls, repo_dir: str) -> None:

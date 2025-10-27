@@ -11,8 +11,8 @@ from objaverse.xl.smithsonian import SmithsonianDownloader
 
 downloaders = {
     "github": GitHubDownloader(),
-    "smithsonian": SmithsonianDownloader(),
-    "sketchfab": SketchfabDownloader(),
+    #"smithsonian": SmithsonianDownloader(),
+    #"sketchfab": SketchfabDownloader(),
 }
 
 

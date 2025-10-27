@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import random
 from multiprocessing import Pool
 from typing import Callable, Dict, List, Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -175,8 +176,8 @@ class GitHubDownloader(ObjaverseSource):
             command,
             env=clone_env,
             command_name=" ".join(display_command),
-            max_retries=3,
-            retry_delay=5.0,
+            max_retries=5,
+            retry_delay=2.0,
         )
 
         if success and token:
@@ -233,14 +234,33 @@ class GitHubDownloader(ObjaverseSource):
                 logger.error(
                     "Error running command `{}` (exit code {})", display, e.returncode
                 )
-                if e.stdout:
-                    logger.error("stdout: {}", e.stdout.strip())
-                if e.stderr:
-                    logger.error("stderr: {}", e.stderr.strip())
+                stdout_text = e.stdout.strip() if e.stdout else ""
+                stderr_text = e.stderr.strip() if e.stderr else ""
+                if stdout_text:
+                    logger.error("stdout: {}", stdout_text)
+                if stderr_text:
+                    logger.error("stderr: {}", stderr_text)
+
+                lowered = stderr_text.lower()
+                auth_failure_keywords = (
+                    "fatal: authentication failed",
+                    "fatal: could not read password",
+                    "permission denied (publickey)",
+                    "remote: permission to",
+                    "invalid username or password",
+                )
+                if any(keyword in lowered for keyword in auth_failure_keywords):
+                    logger.warning(
+                        "Authentication failure detected while running `{}`; not retrying.",
+                        display,
+                    )
+                    return False
 
                 if attempt < max_retries:
-                    delay = retry_delay * (2**attempt)
+                    base_delay = retry_delay * (2**attempt)
                     attempt += 1
+                    jitter = random.uniform(0.5, 1.5)
+                    delay = base_delay * jitter
                     logger.warning(
                         "Retrying command `{}` in {:.1f}s (attempt {}/{})",
                         display,
@@ -312,8 +332,8 @@ class GitHubDownloader(ObjaverseSource):
                     if not cls._run_command_with_check(
                         ["git", "fetch", "origin", commit_hash],
                         target_directory,
-                        max_retries=2,
-                        retry_delay=5.0,
+                        max_retries=5,
+                        retry_delay=2.0,
                     ):
                         logger.error(
                             f"Error in git fetch! Sticking with {repo_commit_hash=} instead of {commit_hash=}"
@@ -486,8 +506,8 @@ class GitHubDownloader(ObjaverseSource):
                 ["git", "lfs", "pull"],
                 cwd=repo_dir,
                 command_name="git lfs pull",
-                max_retries=2,
-                retry_delay=5.0,
+                max_retries=5,
+                retry_delay=2.0,
             )
 
     @classmethod

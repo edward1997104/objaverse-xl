@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-import time
 from multiprocessing import Pool
 from typing import Callable, Dict, List, Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -175,8 +174,6 @@ class GitHubDownloader(ObjaverseSource):
             command,
             env=clone_env,
             command_name=" ".join(display_command),
-            max_retries=3,
-            retry_delay=5.0,
         )
 
         if success and token:
@@ -195,8 +192,6 @@ class GitHubDownloader(ObjaverseSource):
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         command_name: Optional[str] = None,
-        max_retries: int = 0,
-        retry_delay: float = 1.0,
     ) -> bool:
         """Helper function to run a command and check if it was successful.
 
@@ -213,45 +208,29 @@ class GitHubDownloader(ObjaverseSource):
             bool: True if the command was successful, False otherwise.
         """
         display = command_name if command_name is not None else " ".join(command)
-        attempt = 0
-        while True:
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=cwd,
-                    check=True,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
-                if completed.stdout:
-                    logger.debug("stdout: {}", completed.stdout.strip())
-                if completed.stderr:
-                    logger.debug("stderr: {}", completed.stderr.strip())
-                return True
-            except subprocess.CalledProcessError as e:
-                logger.error(
-                    "Error running command `{}` (exit code {})", display, e.returncode
-                )
-                if e.stdout:
-                    logger.error("stdout: {}", e.stdout.strip())
-                if e.stderr:
-                    logger.error("stderr: {}", e.stderr.strip())
-
-                if attempt < max_retries:
-                    delay = retry_delay * (2**attempt)
-                    attempt += 1
-                    logger.warning(
-                        "Retrying command `{}` in {:.1f}s (attempt {}/{})",
-                        display,
-                        delay,
-                        attempt,
-                        max_retries + 1,
-                    )
-                    time.sleep(delay)
-                    continue
-
-                return False
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if completed.stdout:
+                logger.debug("stdout: {}", completed.stdout.strip())
+            if completed.stderr:
+                logger.debug("stderr: {}", completed.stderr.strip())
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "Error running command `{}` (exit code {})", display, e.returncode
+            )
+            if e.stdout:
+                logger.error("stdout: {}", e.stdout.strip())
+            if e.stderr:
+                logger.error("stderr: {}", e.stderr.strip())
+            return False
 
     @classmethod
     def _process_repo(
@@ -310,10 +289,7 @@ class GitHubDownloader(ObjaverseSource):
                 if repo_commit_hash != commit_hash:
                     # run git reset --hard && git checkout 37f4d8d287e201ce52c048bf74d46d6a09d26b2c
                     if not cls._run_command_with_check(
-                        ["git", "fetch", "origin", commit_hash],
-                        target_directory,
-                        max_retries=2,
-                        retry_delay=5.0,
+                        ["git", "fetch", "origin", commit_hash], target_directory
                     ):
                         logger.error(
                             f"Error in git fetch! Sticking with {repo_commit_hash=} instead of {commit_hash=}"
@@ -482,13 +458,7 @@ class GitHubDownloader(ObjaverseSource):
     @classmethod
     def _pull_lfs_files(cls, repo_dir: str) -> None:
         if cls._has_lfs_files(repo_dir):
-            cls._run_command_with_check(
-                ["git", "lfs", "pull"],
-                cwd=repo_dir,
-                command_name="git lfs pull",
-                max_retries=2,
-                retry_delay=5.0,
-            )
+            subprocess.run(["git", "lfs", "pull"], cwd=repo_dir, check=True)
 
     @classmethod
     def _has_lfs_files(cls, repo_dir: str) -> bool:

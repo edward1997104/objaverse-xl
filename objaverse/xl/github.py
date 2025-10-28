@@ -179,7 +179,7 @@ class GitHubDownloader(ObjaverseSource):
             command,
             env=clone_env,
             command_name=" ".join(display_command),
-            max_retries=5,
+            max_retries=3,
             retry_delay=2.0,
         )
 
@@ -406,7 +406,7 @@ class GitHubDownloader(ObjaverseSource):
                     if not cls._run_command_with_check(
                         ["git", "fetch", "origin", commit_hash],
                         target_directory,
-                        max_retries=5,
+                        max_retries=3,
                         retry_delay=2.0,
                     ):
                         logger.error(
@@ -580,7 +580,7 @@ class GitHubDownloader(ObjaverseSource):
                 ["git", "lfs", "pull"],
                 cwd=repo_dir,
                 command_name="git lfs pull",
-                max_retries=5,
+                max_retries=3,
                 retry_delay=2.0,
             )
 

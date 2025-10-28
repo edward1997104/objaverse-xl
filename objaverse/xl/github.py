@@ -305,6 +305,7 @@ class GitHubDownloader(ObjaverseSource):
         repo_objects: Dict[str, str],
         uuid_mappings: Dict[str, str],
         path_exists_cache: Dict[str, bool],
+        extra_prefix: str = "",
     ) -> bool:
         for file_identifier in repo_objects:
             prefix = uuid_mappings.get(file_identifier)
@@ -312,9 +313,10 @@ class GitHubDownloader(ObjaverseSource):
                 continue
 
             prefix_str = str(prefix)
+            base_path = f"{extra_prefix}{prefix_str}"
 
-            candidate_paths = {prefix_str}
-            candidate_paths.update(f"{prefix_str}{ext}" for ext in FILE_EXTENSIONS)
+            candidate_paths = {base_path}
+            candidate_paths.update(f"{base_path}{ext}" for ext in FILE_EXTENSIONS)
 
             for candidate in candidate_paths:
                 if candidate in path_exists_cache:
@@ -736,6 +738,9 @@ class GitHubDownloader(ObjaverseSource):
             s3_mapping_path (str, optional): Path to the pickle file mapping file
                 identifiers to S3 prefixes. Only used when skip_existing_on_s3 is True.
                 Defaults to "/home/ray/mappings.pkl".
+            s3_prefix (str, optional): Additional prefix prepended to each mapped S3
+                path before checking for existence. Only used when skip_existing_on_s3
+                is True. Defaults to "s3://objaverse-xl/github".
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -748,6 +753,7 @@ class GitHubDownloader(ObjaverseSource):
         save_repo_format = kwargs.get("save_repo_format", None)
         handle_new_object = kwargs.get("handle_new_object", None)
         skip_existing_on_s3 = kwargs.get("skip_existing_on_s3", False)
+        s3_prefix = kwargs.get("s3_prefix", "s3://objaverse-xl/github")
         s3_mapping_path = kwargs.get("s3_mapping_path", "/home/ray/mappings.pkl")
 
         if processes is None:
@@ -829,11 +835,19 @@ class GitHubDownloader(ObjaverseSource):
             filtered_repo_id_hashes = []
             skipped_count = 0
 
-            logger.info(f"Checking {len(repo_id_hashes_to_download)} repoIds for existing objects on S3.")
-            for repo_id_hash in tqdm(repo_id_hashes_to_download, desc="Checking repoIds for existing objects on S3"):
+            logger.info(
+                f"Checking {len(repo_id_hashes_to_download)} repoIds for existing objects on S3."
+            )
+            for repo_id_hash in tqdm(
+                repo_id_hashes_to_download,
+                desc="Checking repoIds for existing objects on S3",
+            ):
                 repo_objects = objects_per_repo_id_hash.get(repo_id_hash, {})
                 if cls._repo_has_existing_objects_on_s3(
-                    repo_objects, uuid_mappings, path_exists_cache
+                    repo_objects,
+                    uuid_mappings,
+                    path_exists_cache,
+                    extra_prefix=s3_prefix,
                 ):
                     skipped_count += 1
                     continue

@@ -311,8 +311,10 @@ class GitHubDownloader(ObjaverseSource):
             if not prefix:
                 continue
 
-            candidate_paths = {prefix}
-            candidate_paths.update(prefix + ext for ext in FILE_EXTENSIONS)
+            prefix_str = str(prefix)
+
+            candidate_paths = {prefix_str}
+            candidate_paths.update(f"{prefix_str}{ext}" for ext in FILE_EXTENSIONS)
 
             for candidate in candidate_paths:
                 if candidate in path_exists_cache:

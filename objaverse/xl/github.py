@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 from multiprocessing import Pool
 from typing import Callable, Dict, List, Literal, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
 import pandas as pd
@@ -141,13 +142,56 @@ class GitHubDownloader(ObjaverseSource):
         Returns:
             bool: True if the clone was successful, False otherwise.
         """
-        return cls._run_command_with_check(
-            ["git", "clone", "--depth", "1", repo_url, target_directory],
+        clone_env = os.environ.copy()
+        clone_env.setdefault("GIT_TERMINAL_PROMPT", "0")
+
+        authenticated_repo_url = repo_url
+        token = os.getenv("GITHUB_TOKEN")
+        if token and repo_url.startswith(("https://", "http://")):
+            parsed = urlsplit(repo_url)
+            authenticated_repo_url = urlunsplit(
+                (
+                    parsed.scheme,
+                    f"{token}@{parsed.netloc}",
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+
+        command = ["git", "clone", "--depth", "1", authenticated_repo_url, target_directory]
+
+        display_command = [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            repo_url,
+            target_directory,
+        ]
+
+        success = cls._run_command_with_check(
+            command,
+            env=clone_env,
+            command_name=" ".join(display_command),
         )
+
+        if success and token:
+            cls._run_command_with_check(
+                ["git", "remote", "set-url", "origin", repo_url],
+                cwd=target_directory,
+                command_name="git remote set-url origin <redacted>",
+            )
+
+        return success
 
     @classmethod
     def _run_command_with_check(
-        cls, command: List[str], cwd: Optional[str] = None
+        cls,
+        command: List[str],
+        cwd: Optional[str] = None,
+        env: Optional[Dict[str, str]] = None,
+        command_name: Optional[str] = None,
     ) -> bool:
         """Helper function to run a command and check if it was successful.
 
@@ -155,23 +199,37 @@ class GitHubDownloader(ObjaverseSource):
             command (List[str]): Command to run.
             cwd (Optional[str], optional): Current working directory to run the command
                 in. Defaults to None.
+            env (Optional[Dict[str, str]], optional): Environment variables to pass to
+                the subprocess. Defaults to None.
+            command_name (Optional[str], optional): Human readable command string to log
+                instead of the raw command (useful for hiding secrets). Defaults to None.
 
         Returns:
             bool: True if the command was successful, False otherwise.
         """
+        display = command_name if command_name is not None else " ".join(command)
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 command,
                 cwd=cwd,
                 check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                env=env,
+                capture_output=True,
+                text=True,
             )
+            if completed.stdout:
+                logger.debug("stdout: {}", completed.stdout.strip())
+            if completed.stderr:
+                logger.debug("stderr: {}", completed.stderr.strip())
             return True
         except subprocess.CalledProcessError as e:
-            logger.error("Error:", e)
-            logger.error(e.stdout)
-            logger.error(e.stderr)
+            logger.error(
+                "Error running command `{}` (exit code {})", display, e.returncode
+            )
+            if e.stdout:
+                logger.error("stdout: {}", e.stdout.strip())
+            if e.stderr:
+                logger.error("stderr: {}", e.stderr.strip())
             return False
 
     @classmethod

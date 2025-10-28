@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing
+import pickle
 import os
 import shutil
 import subprocess
@@ -37,9 +38,11 @@ FILE_EXTENSIONS = [
     ".blend",
 ]
 
-
 class GitHubDownloader(ObjaverseSource):
     """Script to download objects from GitHub."""
+
+    _uuid_mappings_cache: Optional[Dict[str, str]] = None
+    _uuid_mappings_cache_path: Optional[str] = None
 
     @classmethod
     def _get_annotations(
@@ -272,6 +275,73 @@ class GitHubDownloader(ObjaverseSource):
                     continue
 
                 return False
+
+    @classmethod
+    def _load_uuid_mappings(cls, mapping_path: str) -> Dict[str, str]:
+        if (
+            cls._uuid_mappings_cache is not None
+            and cls._uuid_mappings_cache_path == mapping_path
+        ):
+            return cls._uuid_mappings_cache
+
+        try:
+            with open(mapping_path, "rb") as f:
+                cls._uuid_mappings_cache = pickle.load(f)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Unable to load UUID mappings from {mapping_path}"
+            ) from exc
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(
+                f"Error loading UUID mappings from {mapping_path}"
+            ) from exc
+
+        cls._uuid_mappings_cache_path = mapping_path
+        return cls._uuid_mappings_cache
+
+    @classmethod
+    def _repo_has_existing_objects_on_s3(
+        cls,
+        repo_objects: Dict[str, str],
+        uuid_mappings: Dict[str, str],
+        path_exists_cache: Dict[str, bool],
+    ) -> bool:
+        for file_identifier in repo_objects:
+            prefix = uuid_mappings.get(file_identifier)
+            if not prefix:
+                continue
+
+            candidate_paths = {prefix}
+            candidate_paths.update(prefix + ext for ext in FILE_EXTENSIONS)
+
+            for candidate in candidate_paths:
+                if candidate in path_exists_cache:
+                    if path_exists_cache[candidate]:
+                        return True
+                    continue
+
+                try:
+                    fs, fs_path = fsspec.core.url_to_fs(candidate)
+                except Exception as exc:  # pragma: no cover - requires remote fs
+                    logger.debug(
+                        "Skipping candidate {} due to filesystem error: {}", candidate, exc
+                    )
+                    path_exists_cache[candidate] = False
+                    continue
+
+                try:
+                    exists = fs.exists(fs_path)
+                except Exception as exc:  # pragma: no cover - requires remote fs
+                    logger.debug(
+                        "Skipping candidate {} due to existence check error: {}", candidate, exc
+                    )
+                    exists = False
+
+                path_exists_cache[candidate] = exists
+                if exists:
+                    return True
+
+        return False
 
     @classmethod
     def _process_repo(
@@ -658,6 +728,12 @@ class GitHubDownloader(ObjaverseSource):
                 - metadata (Dict[str, Any]): Metadata about the 3D object, including the
                     GitHub organization and repo names.
                 Return is not used. Defaults to None.
+            skip_existing_on_s3 (bool, optional): If True, skip downloading repositories
+                when any mapped S3 object already exists for the repo's file identifiers.
+                Defaults to False.
+            s3_mapping_path (str, optional): Path to the pickle file mapping file
+                identifiers to S3 prefixes. Only used when skip_existing_on_s3 is True.
+                Defaults to "/home/ray/mappings.pkl".
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -669,6 +745,8 @@ class GitHubDownloader(ObjaverseSource):
         """
         save_repo_format = kwargs.get("save_repo_format", None)
         handle_new_object = kwargs.get("handle_new_object", None)
+        skip_existing_on_s3 = kwargs.get("skip_existing_on_s3", False)
+        s3_mapping_path = kwargs.get("s3_mapping_path", "/home/ray/mappings.pkl")
 
         if processes is None:
             processes = multiprocessing.cpu_count()
@@ -742,6 +820,34 @@ class GitHubDownloader(ObjaverseSource):
                 )
             )
         objects_per_repo_id_hash = dict(out_list)
+
+        if skip_existing_on_s3 and repo_id_hashes_to_download:
+            uuid_mappings = cls._load_uuid_mappings(s3_mapping_path)
+            path_exists_cache: Dict[str, bool] = {}
+            filtered_repo_id_hashes = []
+            skipped_count = 0
+
+            logger.info(f"Checking {len(repo_id_hashes_to_download)} repoIds for existing objects on S3.")
+            for repo_id_hash in tqdm(repo_id_hashes_to_download, desc="Checking repoIds for existing objects on S3"):
+                repo_objects = objects_per_repo_id_hash.get(repo_id_hash, {})
+                if cls._repo_has_existing_objects_on_s3(
+                    repo_objects, uuid_mappings, path_exists_cache
+                ):
+                    skipped_count += 1
+                    continue
+                filtered_repo_id_hashes.append(repo_id_hash)
+
+            if skipped_count:
+                logger.info(
+                    "Skipping {} repoIds because objects already exist on S3.",
+                    skipped_count,
+                )
+
+            repo_id_hashes_to_download = filtered_repo_id_hashes
+
+            if not repo_id_hashes_to_download:
+                logger.info("No repositories left to download after S3 filtering.")
+                return {}
 
         all_args = [
             (

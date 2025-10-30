@@ -412,6 +412,28 @@ class GitHubDownloader(ObjaverseSource):
                 )
 
     @classmethod
+    def _stream_file_to_fs(
+        cls,
+        fs: fsspec.AbstractFileSystem,
+        src_path: str,
+        dst_path: str,
+        chunk_size: int,
+    ) -> None:
+        if chunk_size <= 0:
+            chunk_size = 1024 * 1024
+
+        parent = os.path.dirname(dst_path)
+        if parent:
+            fs.makedirs(parent, exist_ok=True)
+
+        with open(src_path, "rb") as src, fs.open(dst_path, "wb") as dst:
+            while True:
+                data = src.read(chunk_size)
+                if not data:
+                    break
+                dst.write(data)
+
+    @classmethod
     def _process_repo(
         cls,
         repo_id: str,
@@ -601,9 +623,12 @@ class GitHubDownloader(ObjaverseSource):
                 if save_repo_format != "files":
                     # move the repo to the correct location (with put)
                     archive_path = os.path.join(temp_dir, f"{repo}.{save_repo_format}")
-                    fs.put(
+                    dest_path = os.path.join(dirname, f"{repo}.{save_repo_format}")
+                    cls._stream_file_to_fs(
+                        fs,
                         archive_path,
-                        os.path.join(dirname, f"{repo}.{save_repo_format}"),
+                        dest_path,
+                        repo_archive_chunk_size,
                     )
 
                     for file_identifier in out.copy():

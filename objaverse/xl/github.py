@@ -44,6 +44,7 @@ class GitHubDownloader(ObjaverseSource):
 
     _uuid_mappings_cache: Optional[Dict[str, str]] = None
     _uuid_mappings_cache_path: Optional[str] = None
+    _cleanup_invocation_count: int = 0
 
     @classmethod
     def _get_annotations(
@@ -466,6 +467,37 @@ class GitHubDownloader(ObjaverseSource):
                 if not data:
                     break
                 dst.write(data)
+
+    @classmethod
+    def _cleanup_local_archives(cls, fs: fsspec.AbstractFileSystem, base_dir: str) -> None:
+        repos_dir = os.path.join(base_dir, "repos")
+        try:
+            if not fs.exists(repos_dir):
+                return
+            logger.info("Removing local repository archives at {}", repos_dir)
+            fs.rm(repos_dir, recursive=True)
+            fs.makedirs(repos_dir, exist_ok=True)
+        except FileNotFoundError:
+            return
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("Failed to cleanup local archives at {}: {}", repos_dir, exc)
+
+    @classmethod
+    def _maybe_cleanup_local_archives(
+        cls,
+        fs: fsspec.AbstractFileSystem,
+        base_dir: str,
+        enabled: bool,
+        interval: int,
+    ) -> None:
+        if not enabled:
+            return
+        if interval <= 0:
+            interval = 1
+        cls._cleanup_invocation_count += 1
+        if cls._cleanup_invocation_count % interval != 0:
+            return
+        cls._cleanup_local_archives(fs, base_dir)
 
     @staticmethod
     def _filesystem_identity(fs: fsspec.AbstractFileSystem) -> Tuple[Any, Any, Any]:
@@ -917,6 +949,12 @@ class GitHubDownloader(ObjaverseSource):
                 repository archives to remote storage. Defaults to 8 * 1024 * 1024.
                 When saving repositories as "zip", parallelism is capped internally to
                 limit peak memory usage per worker.
+            cleanup_local_archives (bool, optional): When True, periodically delete the
+                local repository archives under `download_dir/github/repos` after
+                uploads complete. Defaults to False.
+            cleanup_local_archives_every (int, optional): Run the cleanup after this
+                many `download_objects` invocations when `cleanup_local_archives` is
+                enabled. Defaults to 1.
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -932,6 +970,8 @@ class GitHubDownloader(ObjaverseSource):
         s3_prefix = kwargs.get("s3_prefix", "s3://objaverse-xl/github")
         s3_mapping_path = kwargs.get("s3_mapping_path", "/home/ray/mappings.pkl")
         repo_archive_chunk_size = kwargs.get("repo_archive_chunk_size", 8 * 1024 * 1024)
+        cleanup_local_archives = kwargs.get("cleanup_local_archives", True)
+        cleanup_local_archives_every = kwargs.get("cleanup_local_archives_every", 1)
         uuid_mappings: Optional[Dict[str, str]] = None
 
         need_uuid_mappings = skip_existing_on_s3 or save_repo_format == "zip"
@@ -1107,5 +1147,12 @@ class GitHubDownloader(ObjaverseSource):
         out_dict = {}
         for x in out:
             out_dict.update(x)
+
+        cls._maybe_cleanup_local_archives(
+            fs,
+            path,
+            cleanup_local_archives,
+            cleanup_local_archives_every,
+        )
 
         return out_dict

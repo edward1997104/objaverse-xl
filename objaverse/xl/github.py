@@ -371,10 +371,14 @@ class GitHubDownloader(ObjaverseSource):
         expected_objects: Dict[str, str],
         uuid_mappings: Dict[str, str],
         extra_prefix: str,
+        chunk_size: int,
     ) -> None:
         if not os.path.exists(zip_path):
             logger.warning("Zip path {} does not exist; skipping S3 upload.", zip_path)
             return
+
+        if chunk_size <= 0:
+            chunk_size = 1024 * 1024  # default to 1 MiB chunks
 
         destinations = set()
         for file_identifier in expected_objects:
@@ -390,7 +394,14 @@ class GitHubDownloader(ObjaverseSource):
                 parent = os.path.dirname(dest_path)
                 if parent:
                     dest_fs.makedirs(parent, exist_ok=True)
-                dest_fs.put(zip_path, dest_path)
+                with open(zip_path, "rb") as src, dest_fs.open(
+                    dest_path, "wb"
+                ) as dst:
+                    while True:
+                        data = src.read(chunk_size)
+                        if not data:
+                            break
+                        dst.write(data)
                 logger.debug("Uploaded repo archive {} to {}", zip_path, dest)
             except Exception as exc:  # pragma: no cover - remote fs interaction
                 logger.error(
@@ -412,6 +423,7 @@ class GitHubDownloader(ObjaverseSource):
         commit_hash: Optional[str],
         uuid_mappings: Optional[Dict[str, str]] = None,
         s3_prefix: str = "",
+        repo_archive_chunk_size: int = 8 * 1024 * 1024,
     ) -> Dict[str, str]:
         """Process a single repo.
 
@@ -427,6 +439,8 @@ class GitHubDownloader(ObjaverseSource):
                 objects.
             s3_prefix (str): Prefix prepended to uuid_mappings entries when computing
                 S3 destinations for repo archives.
+            repo_archive_chunk_size (int): Number of bytes per chunk when streaming repo
+                archives to the remote filesystem.
             {and the rest of the args are the same as download_objects}
 
         Returns:
@@ -600,6 +614,7 @@ class GitHubDownloader(ObjaverseSource):
                             expected_objects,
                             uuid_mappings,
                             s3_prefix,
+                            repo_archive_chunk_size,
                         )
                         try:
                             os.remove(archive_path)
@@ -707,6 +722,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_new_object,
             uuid_mappings,
             s3_prefix,
+            repo_archive_chunk_size,
         ) = args
         repo_id = "/".join(repo_id_hash.split("/")[:2])
         commit_hash = repo_id_hash.split("/")[2]
@@ -723,6 +739,7 @@ class GitHubDownloader(ObjaverseSource):
             commit_hash=commit_hash,
             uuid_mappings=uuid_mappings,
             s3_prefix=s3_prefix,
+            repo_archive_chunk_size=repo_archive_chunk_size,
         )
 
     @classmethod
@@ -817,6 +834,8 @@ class GitHubDownloader(ObjaverseSource):
             s3_prefix (str, optional): Additional prefix prepended to each mapped S3
                 path before checking for existence. Only used when skip_existing_on_s3
                 is True. Defaults to "s3://objaverse-xl/github".
+            repo_archive_chunk_size (int, optional): Chunk size (bytes) used when streaming
+                repository archives to remote storage. Defaults to 8 * 1024 * 1024.
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -831,6 +850,7 @@ class GitHubDownloader(ObjaverseSource):
         skip_existing_on_s3 = kwargs.get("skip_existing_on_s3", False)
         s3_prefix = kwargs.get("s3_prefix", "s3://objaverse-xl/github")
         s3_mapping_path = kwargs.get("s3_mapping_path", "/home/ray/mappings.pkl")
+        repo_archive_chunk_size = kwargs.get("repo_archive_chunk_size", 8 * 1024 * 1024)
         uuid_mappings: Optional[Dict[str, str]] = None
 
         need_uuid_mappings = skip_existing_on_s3 or save_repo_format == "zip"
@@ -973,6 +993,7 @@ class GitHubDownloader(ObjaverseSource):
                 handle_new_object,
                 uuid_mappings if save_repo_format == "zip" else None,
                 s3_prefix,
+                repo_archive_chunk_size,
             )
             for repo_id_hash in repo_id_hashes_to_download
         ]

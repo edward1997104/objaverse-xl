@@ -1,5 +1,6 @@
 """Script to download objects from GitHub."""
 
+import gc
 import json
 import multiprocessing
 import pickle
@@ -11,7 +12,7 @@ import tempfile
 import time
 import random
 from multiprocessing import Pool
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import fsspec
@@ -380,36 +381,69 @@ class GitHubDownloader(ObjaverseSource):
         if chunk_size <= 0:
             chunk_size = 1024 * 1024  # default to 1 MiB chunks
 
-        destinations = set()
+        destination_groups: Dict[
+            Tuple[Any, Any, Any], Dict[str, Any]
+        ] = {}
         for file_identifier in expected_objects:
             prefix = uuid_mappings.get(file_identifier)
             if not prefix:
                 continue
             base_path = cls._compose_s3_path(extra_prefix, str(prefix))
-            destinations.add(f"{base_path}.zip")
-
-        for dest in destinations:
+            dest = f"{base_path}.zip"
             try:
-                # logging the upload
-                logger.info(f"Uploading repo archive {zip_path} to {dest}")
-                
                 dest_fs, dest_path = fsspec.core.url_to_fs(dest)
-                parent = os.path.dirname(dest_path)
-                if parent:
-                    dest_fs.makedirs(parent, exist_ok=True)
-                with open(zip_path, "rb") as src, dest_fs.open(
-                    dest_path, "wb"
-                ) as dst:
-                    while True:
-                        data = src.read(chunk_size)
-                        if not data:
-                            break
-                        dst.write(data)
-                logger.debug("Uploaded repo archive {} to {}", zip_path, dest)
             except Exception as exc:  # pragma: no cover - remote fs interaction
                 logger.error(
-                    "Failed to upload repo archive {} to {}: {}", zip_path, dest, exc
+                    "Failed to resolve filesystem for {}: {}", dest, exc
                 )
+                continue
+
+            identity = cls._filesystem_identity(dest_fs)
+            if identity not in destination_groups:
+                destination_groups[identity] = {"fs": dest_fs, "paths": []}
+            destination_groups[identity]["paths"].append(dest_path)
+
+        for group in destination_groups.values():
+            dest_fs = group["fs"]
+            paths = group["paths"]
+            if not paths:
+                continue
+
+            primary_path = paths[0]
+            try:
+                cls._stream_file_to_fs(dest_fs, zip_path, primary_path, chunk_size)
+                logger.debug("Uploaded repo archive {} to {}", zip_path, primary_path)
+            except Exception as exc:  # pragma: no cover
+                logger.error(
+                    "Failed to upload repo archive {} to {}: {}", zip_path, primary_path, exc
+                )
+                continue
+
+            for secondary_path in paths[1:]:
+                copied = False
+                if hasattr(dest_fs, "copy"):
+                    try:
+                        dest_fs.copy(primary_path, secondary_path)
+                        copied = True
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug(
+                            "Filesystem copy {} -> {} failed ({}); falling back to streaming.",
+                            primary_path,
+                            secondary_path,
+                            exc,
+                        )
+                if not copied:
+                    try:
+                        cls._stream_file_to_fs(
+                            dest_fs, zip_path, secondary_path, chunk_size
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.error(
+                            "Failed to mirror repo archive {} to {}: {}",
+                            zip_path,
+                            secondary_path,
+                            exc,
+                        )
 
     @classmethod
     def _stream_file_to_fs(
@@ -432,6 +466,22 @@ class GitHubDownloader(ObjaverseSource):
                 if not data:
                     break
                 dst.write(data)
+
+    @staticmethod
+    def _filesystem_identity(fs: fsspec.AbstractFileSystem) -> Tuple[Any, Any, Any]:
+        protocol = getattr(fs, "protocol", None)
+        if isinstance(protocol, (list, tuple)):
+            protocol_key = tuple(protocol)
+        else:
+            protocol_key = protocol
+
+        storage_options = getattr(fs, "storage_options", None)
+        if isinstance(storage_options, dict):
+            storage_key = tuple(sorted(storage_options.items()))
+        else:
+            storage_key = storage_options
+
+        return (fs.__class__, protocol_key, storage_key)
 
     @classmethod
     def _process_repo(
@@ -670,6 +720,7 @@ class GitHubDownloader(ObjaverseSource):
                         metadata=dict(github_organization=org, github_repo=repo),
                     )
 
+        gc.collect()
         return out
 
     @classmethod
@@ -864,6 +915,8 @@ class GitHubDownloader(ObjaverseSource):
                 is True. Defaults to "s3://objaverse-xl/github".
             repo_archive_chunk_size (int, optional): Chunk size (bytes) used when streaming
                 repository archives to remote storage. Defaults to 8 * 1024 * 1024.
+                When saving repositories as "zip", parallelism is capped internally to
+                limit peak memory usage per worker.
 
         Raises:
             ValueError: If download_dir is None and save_repo_format is not None.
@@ -897,6 +950,10 @@ class GitHubDownloader(ObjaverseSource):
 
         if processes is None:
             processes = multiprocessing.cpu_count()
+
+        if save_repo_format == "zip":
+            max_zip_processes = max(1, min(4, multiprocessing.cpu_count() // 2))
+            processes = max(1, min(processes, max_zip_processes))
         if download_dir is None:
             if save_repo_format is not None:
                 raise ValueError(

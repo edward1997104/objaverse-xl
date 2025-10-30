@@ -300,6 +300,23 @@ class GitHubDownloader(ObjaverseSource):
         return cls._uuid_mappings_cache
 
     @classmethod
+    def _compose_s3_path(cls, extra_prefix: str, prefix: str) -> str:
+        prefix_str = str(prefix)
+        if "://" in prefix_str:
+            return prefix_str
+
+        if not extra_prefix:
+            return prefix_str
+
+        cleaned_prefix = prefix_str.lstrip("/")
+        cleaned_extra = extra_prefix.rstrip("/")
+
+        if not cleaned_extra:
+            return cleaned_prefix
+
+        return f"{cleaned_extra}/{cleaned_prefix}"
+
+    @classmethod
     def _repo_has_existing_objects_on_s3(
         cls,
         repo_objects: Dict[str, str],
@@ -312,11 +329,11 @@ class GitHubDownloader(ObjaverseSource):
             if not prefix:
                 continue
 
-            prefix_str = str(prefix)
-            base_path = f"{extra_prefix}{prefix_str}"
+            base_path = cls._compose_s3_path(extra_prefix, str(prefix))
 
             candidate_paths = {base_path}
             candidate_paths.update(f"{base_path}{ext}" for ext in FILE_EXTENSIONS)
+            candidate_paths.add(f"{base_path}.zip")
 
             for candidate in candidate_paths:
                 if candidate in path_exists_cache:
@@ -348,6 +365,39 @@ class GitHubDownloader(ObjaverseSource):
         return False
 
     @classmethod
+    def _upload_repo_zip_to_s3(
+        cls,
+        zip_path: str,
+        expected_objects: Dict[str, str],
+        uuid_mappings: Dict[str, str],
+        extra_prefix: str,
+    ) -> None:
+        if not os.path.exists(zip_path):
+            logger.warning("Zip path {} does not exist; skipping S3 upload.", zip_path)
+            return
+
+        destinations = set()
+        for file_identifier in expected_objects:
+            prefix = uuid_mappings.get(file_identifier)
+            if not prefix:
+                continue
+            base_path = cls._compose_s3_path(extra_prefix, str(prefix))
+            destinations.add(f"{base_path}.zip")
+
+        for dest in destinations:
+            try:
+                dest_fs, dest_path = fsspec.core.url_to_fs(dest)
+                parent = os.path.dirname(dest_path)
+                if parent:
+                    dest_fs.makedirs(parent, exist_ok=True)
+                dest_fs.put(zip_path, dest_path)
+                logger.debug("Uploaded repo archive {} to {}", zip_path, dest)
+            except Exception as exc:  # pragma: no cover - remote fs interaction
+                logger.error(
+                    "Failed to upload repo archive {} to {}: {}", zip_path, dest, exc
+                )
+
+    @classmethod
     def _process_repo(
         cls,
         repo_id: str,
@@ -360,6 +410,8 @@ class GitHubDownloader(ObjaverseSource):
         handle_missing_object: Optional[Callable],
         handle_new_object: Optional[Callable],
         commit_hash: Optional[str],
+        uuid_mappings: Optional[Dict[str, str]] = None,
+        s3_prefix: str = "",
     ) -> Dict[str, str]:
         """Process a single repo.
 
@@ -370,6 +422,11 @@ class GitHubDownloader(ObjaverseSource):
             expected_objects (Dict[str, str]): Dictionary of objects that one expects to
                 find in the repo. Keys are the "fileIdentifier" (i.e., the GitHub URL in
                 this case) and values are the "sha256" of the objects.
+            uuid_mappings (Optional[Dict[str, str]]): Mapping from the file identifier
+                to its S3 prefix, used for uploading repo archives alongside individual
+                objects.
+            s3_prefix (str): Prefix prepended to uuid_mappings entries when computing
+                S3 destinations for repo archives.
             {and the rest of the args are the same as download_objects}
 
         Returns:
@@ -526,8 +583,9 @@ class GitHubDownloader(ObjaverseSource):
                 fs.makedirs(dirname, exist_ok=True)
                 if save_repo_format != "files":
                     # move the repo to the correct location (with put)
+                    archive_path = os.path.join(temp_dir, f"{repo}.{save_repo_format}")
                     fs.put(
-                        os.path.join(temp_dir, f"{repo}.{save_repo_format}"),
+                        archive_path,
                         os.path.join(dirname, f"{repo}.{save_repo_format}"),
                     )
 
@@ -535,6 +593,20 @@ class GitHubDownloader(ObjaverseSource):
                         out[file_identifier] = os.path.join(
                             dirname, f"{repo}.{save_repo_format}", out[file_identifier]
                         )
+
+                    if save_repo_format == "zip" and uuid_mappings:
+                        cls._upload_repo_zip_to_s3(
+                            archive_path,
+                            expected_objects,
+                            uuid_mappings,
+                            s3_prefix,
+                        )
+                        try:
+                            os.remove(archive_path)
+                        except OSError as exc:
+                            logger.debug(
+                                "Unable to remove temporary repo archive {}: {}", archive_path, exc
+                            )
                 else:
                     # move the repo to the correct location (with put)
                     fs.put(target_directory, dirname, recursive=True)
@@ -633,6 +705,8 @@ class GitHubDownloader(ObjaverseSource):
             handle_modified_object,
             handle_missing_object,
             handle_new_object,
+            uuid_mappings,
+            s3_prefix,
         ) = args
         repo_id = "/".join(repo_id_hash.split("/")[:2])
         commit_hash = repo_id_hash.split("/")[2]
@@ -647,6 +721,8 @@ class GitHubDownloader(ObjaverseSource):
             handle_missing_object=handle_missing_object,
             handle_new_object=handle_new_object,
             commit_hash=commit_hash,
+            uuid_mappings=uuid_mappings,
+            s3_prefix=s3_prefix,
         )
 
     @classmethod
@@ -755,6 +831,21 @@ class GitHubDownloader(ObjaverseSource):
         skip_existing_on_s3 = kwargs.get("skip_existing_on_s3", False)
         s3_prefix = kwargs.get("s3_prefix", "s3://objaverse-xl/github")
         s3_mapping_path = kwargs.get("s3_mapping_path", "/home/ray/mappings.pkl")
+        uuid_mappings: Optional[Dict[str, str]] = None
+
+        need_uuid_mappings = skip_existing_on_s3 or save_repo_format == "zip"
+        if need_uuid_mappings:
+            try:
+                uuid_mappings = cls._load_uuid_mappings(s3_mapping_path)
+            except Exception as exc:
+                if skip_existing_on_s3:
+                    raise
+                logger.warning(
+                    "Unable to load UUID mappings from {} ({}); skipping repo archive upload.",
+                    s3_mapping_path,
+                    exc,
+                )
+                uuid_mappings = None
 
         if processes is None:
             processes = multiprocessing.cpu_count()
@@ -830,40 +921,44 @@ class GitHubDownloader(ObjaverseSource):
         objects_per_repo_id_hash = dict(out_list)
 
         if skip_existing_on_s3 and repo_id_hashes_to_download:
-            uuid_mappings = cls._load_uuid_mappings(s3_mapping_path)
-            path_exists_cache: Dict[str, bool] = {}
-            filtered_repo_id_hashes = []
-            skipped_count = 0
-
-            logger.info(
-                f"Checking {len(repo_id_hashes_to_download)} repoIds for existing objects on S3."
-            )
-            for repo_id_hash in tqdm(
-                repo_id_hashes_to_download,
-                desc="Checking repoIds for existing objects on S3",
-            ):
-                repo_objects = objects_per_repo_id_hash.get(repo_id_hash, {})
-                if cls._repo_has_existing_objects_on_s3(
-                    repo_objects,
-                    uuid_mappings,
-                    path_exists_cache,
-                    extra_prefix=s3_prefix,
-                ):
-                    skipped_count += 1
-                    continue
-                filtered_repo_id_hashes.append(repo_id_hash)
-
-            if skipped_count:
-                logger.info(
-                    "Skipping {} repoIds because objects already exist on S3.",
-                    skipped_count,
+            if not uuid_mappings:
+                logger.warning(
+                    "UUID mappings unavailable; skipping S3 existence filtering."
                 )
+            else:
+                path_exists_cache: Dict[str, bool] = {}
+                filtered_repo_id_hashes = []
+                skipped_count = 0
 
-            repo_id_hashes_to_download = filtered_repo_id_hashes
+                logger.info(
+                    f"Checking {len(repo_id_hashes_to_download)} repoIds for existing objects on S3."
+                )
+                for repo_id_hash in tqdm(
+                    repo_id_hashes_to_download,
+                    desc="Checking repoIds for existing objects on S3",
+                ):
+                    repo_objects = objects_per_repo_id_hash.get(repo_id_hash, {})
+                    if cls._repo_has_existing_objects_on_s3(
+                        repo_objects,
+                        uuid_mappings,
+                        path_exists_cache,
+                        extra_prefix=s3_prefix,
+                    ):
+                        skipped_count += 1
+                        continue
+                    filtered_repo_id_hashes.append(repo_id_hash)
 
-            if not repo_id_hashes_to_download:
-                logger.info("No repositories left to download after S3 filtering.")
-                return {}
+                if skipped_count:
+                    logger.info(
+                        "Skipping {} repoIds because objects already exist on S3.",
+                        skipped_count,
+                    )
+
+                repo_id_hashes_to_download = filtered_repo_id_hashes
+
+                if not repo_id_hashes_to_download:
+                    logger.info("No repositories left to download after S3 filtering.")
+                    return {}
 
         all_args = [
             (
@@ -876,6 +971,8 @@ class GitHubDownloader(ObjaverseSource):
                 handle_modified_object,
                 handle_missing_object,
                 handle_new_object,
+                uuid_mappings if save_repo_format == "zip" else None,
+                s3_prefix,
             )
             for repo_id_hash in repo_id_hashes_to_download
         ]

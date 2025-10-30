@@ -390,6 +390,9 @@ class GitHubDownloader(ObjaverseSource):
 
         for dest in destinations:
             try:
+                # logging the upload
+                logger.info(f"Uploading repo archive {zip_path} to {dest}")
+                
                 dest_fs, dest_path = fsspec.core.url_to_fs(dest)
                 parent = os.path.dirname(dest_path)
                 if parent:
@@ -720,7 +723,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_modified_object,
             handle_missing_object,
             handle_new_object,
-            uuid_mappings,
+            repo_uuid_mappings,
             s3_prefix,
             repo_archive_chunk_size,
         ) = args
@@ -737,7 +740,7 @@ class GitHubDownloader(ObjaverseSource):
             handle_missing_object=handle_missing_object,
             handle_new_object=handle_new_object,
             commit_hash=commit_hash,
-            uuid_mappings=uuid_mappings,
+            uuid_mappings=repo_uuid_mappings,
             s3_prefix=s3_prefix,
             repo_archive_chunk_size=repo_archive_chunk_size,
         )
@@ -980,23 +983,34 @@ class GitHubDownloader(ObjaverseSource):
                     logger.info("No repositories left to download after S3 filtering.")
                     return {}
 
-        all_args = [
-            (
-                repo_id_hash,
-                fs,
-                path,
-                save_repo_format,
-                objects_per_repo_id_hash[repo_id_hash],
-                handle_found_object,
-                handle_modified_object,
-                handle_missing_object,
-                handle_new_object,
-                uuid_mappings if save_repo_format == "zip" else None,
-                s3_prefix,
-                repo_archive_chunk_size,
+        all_args = []
+        for repo_id_hash in repo_id_hashes_to_download:
+            expected_objects = objects_per_repo_id_hash[repo_id_hash]
+            if save_repo_format == "zip" and uuid_mappings:
+                repo_uuid_mappings = {
+                    fid: uuid_mappings[fid]
+                    for fid in expected_objects
+                    if fid in uuid_mappings
+                }
+            else:
+                repo_uuid_mappings = None
+
+            all_args.append(
+                (
+                    repo_id_hash,
+                    fs,
+                    path,
+                    save_repo_format,
+                    expected_objects,
+                    handle_found_object,
+                    handle_modified_object,
+                    handle_missing_object,
+                    handle_new_object,
+                    repo_uuid_mappings,
+                    s3_prefix,
+                    repo_archive_chunk_size,
+                )
             )
-            for repo_id_hash in repo_id_hashes_to_download
-        ]
 
         with Pool(processes=processes) as pool:
             # use tqdm to show progress

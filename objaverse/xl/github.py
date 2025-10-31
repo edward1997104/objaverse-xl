@@ -252,6 +252,7 @@ class GitHubDownloader(ObjaverseSource):
                     "permission denied (publickey)",
                     "remote: permission to",
                     "invalid username or password",
+                    "not found"
                 )
                 if any(keyword in lowered for keyword in auth_failure_keywords):
                     logger.warning(

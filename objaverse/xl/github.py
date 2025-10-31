@@ -324,6 +324,7 @@ class GitHubDownloader(ObjaverseSource):
         uuid_mappings: Dict[str, str],
         path_exists_cache: Dict[str, bool],
         extra_prefix: str = "",
+        zip_only: bool = False,
     ) -> bool:
         for file_identifier in repo_objects:
             prefix = uuid_mappings.get(file_identifier)
@@ -332,9 +333,12 @@ class GitHubDownloader(ObjaverseSource):
 
             base_path = cls._compose_s3_path(extra_prefix, str(prefix))
 
-            candidate_paths = {base_path}
-            candidate_paths.update(f"{base_path}{ext}" for ext in FILE_EXTENSIONS)
-            candidate_paths.add(f"{base_path}.zip")
+            if zip_only:
+                candidate_paths = {f"{base_path}.zip"}
+            else:
+                candidate_paths = {base_path}
+                candidate_paths.update(f"{base_path}{ext}" for ext in FILE_EXTENSIONS)
+                candidate_paths.add(f"{base_path}.zip")
 
             for candidate in candidate_paths:
                 if candidate in path_exists_cache:
@@ -1090,6 +1094,7 @@ class GitHubDownloader(ObjaverseSource):
                         uuid_mappings,
                         path_exists_cache,
                         extra_prefix=s3_prefix,
+                        zip_only=save_repo_format == "zip",
                     ):
                         skipped_count += 1
                         continue
